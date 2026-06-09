@@ -169,19 +169,23 @@ def load_config() -> dict:
                 "kill_processes": [],
                 "_kill_processes_help": "Только для tunnels_only: список .exe для taskkill при падении VPN. Например: [\"chrome.exe\"]",
                 "firewall": {
-                    "_help": "Always-on kill switch. Активируется при старте программы. Весь трафик идёт ТОЛЬКО через VPN-интерфейс. В обход разрешён только коннект к самому VPN-серверу.",
+                    "_help": "Always-on kill switch. Активируется при старте программы. Весь трафик идёт ТОЛЬКО через VPN-интерфейс. В обход разрешён только сам процесс openvpn.exe (для коннекта к серверу) + loopback/DHCP/локалка.",
+                    "openvpn_exe": "C:\\Program Files\\OpenVPN\\bin\\openvpn.exe",
+                    "_openvpn_exe_help": "Путь к openvpn.exe. Этому процессу разрешается ходить наружу — он сам резолвит DNS и коннектится к серверу (в т.ч. failover). Это надёжнее whitelist по IP и убирает DNS-утечку. Если оставить пустым — программа поищет в стандартных местах.",
+                    "vpn_interface": None,
+                    "_vpn_interface_help": "Имя сетевого адаптера OpenVPN (например 'OpenVPN TAP-Windows6'). Весь трафик на нём разрешается — это трафик приложений ВНУТРИ туннеля. null = автодетект (ищет TAP-Windows/Wintun). Узнать имя: PowerShell 'Get-NetAdapter'. Если автодетект не сработал — впиши имя сюда.",
                     "vpn_server_ips": [],
-                    "_vpn_server_ips_help": "ОБЯЗАТЕЛЬНО заполни перед enabled=true! Только IPv4-адреса (НЕ DNS-имена). Узнать IP: nslookup vpn.example.com из обычного cmd до включения kill switch. Можно несколько IP — если у VPN-провайдера failover-серверы. Например: [\"185.220.101.42\", \"185.220.101.43\"]",
+                    "_vpn_server_ips_help": "НЕОБЯЗАТЕЛЬНО при заданном openvpn_exe (он сам коннектится). Это запасной whitelist VPN-сервера по IP. Только IPv4 (НЕ DNS-имена). Узнать: nslookup vpn.example.com.",
                     "vpn_server_ports": [1194],
-                    "_vpn_server_ports_help": "Порты VPN-сервера. Обычно 1194 (OpenVPN), 51820 (WireGuard), 443.",
+                    "_vpn_server_ports_help": "Порты VPN-сервера (для запасного whitelist). 1194 (OpenVPN), 51820 (WireGuard), 443.",
                     "vpn_protocols": ["udp"],
-                    "_vpn_protocols_help": "Протоколы: [\"udp\"], [\"tcp\"], или оба [\"udp\", \"tcp\"]",
+                    "_vpn_protocols_help": "Протоколы запасного whitelist: [\"udp\"], [\"tcp\"], или оба.",
                     "vpn_tunnel_subnet": "10.8.0.0/24",
-                    "_vpn_tunnel_subnet_help": "ВАЖНО для OpenVPN/WireGuard! Подсеть туннеля. Без неё kill switch заблокирует трафик ВНУТРИ туннеля (TAP-адаптер OpenVPN не относится к типу 'ras'). Узнать: после коннекта VPN выполни ipconfig, найди TAP/TUN-адаптер, возьми его подсеть. Обычно у OpenVPN 10.8.0.0/24. Для встроенного Windows-VPN можно оставить null.",
+                    "_vpn_tunnel_subnet_help": "Запасной вариант, если vpn_interface не задан и адаптер не задетектился. Подсеть туннеля. Обычно у OpenVPN 10.8.0.0/24. Лучше задать vpn_interface — надёжнее.",
                     "allow_local_network": True,
                     "_allow_local_network_help": "Разрешать локальную подсеть (для NAS, принтеров, RDP в локалке).",
                     "cleanup_on_exit": False,
-                    "_cleanup_on_exit_help": "ВАЖНО: false (по умолчанию) — правила остаются в firewall даже после выхода из программы. Параноидальная модель: ничего не утечёт даже если прога выключена. true — при выходе интернет работает как обычно (без kill switch).",
+                    "_cleanup_on_exit_help": "false (по умолчанию) — правила остаются в firewall даже после выхода. Параноидальная модель: не утечёт даже если прога выключена. Аварийно снять: запусти 'ОТКЛЮЧИТЬ-killswitch.bat' от админа. true — выход из программы разблокирует интернет.",
                     "inbound_allow": [
                         {
                             "enabled": False,
@@ -204,9 +208,11 @@ def load_config() -> dict:
                     "autostart": True,
                     "depends_on": None,
                     "health_check": {
-                        "type": "ping",
+                        "type": "openvpn",
+                        "process": "openvpn.exe",
+                        "_process_help": "Имя процесса OpenVPN. VPN считается живым только если процесс запущен.",
                         "host": "10.8.0.1",
-                        "_host_help": "IP внутри VPN-сети для проверки что туннель жив. Шлюз VPN. Узнать после коннекта: ipconfig → адаптер TAP/TUN.",
+                        "_host_help": "IP внутри VPN-сети (шлюз туннеля) для проверки что туннель реально жив. Узнать после коннекта: ipconfig → адаптер TAP/TUN. Если оставить null — проверяется только наличие процесса.",
                         "interval_sec": 15,
                         "timeout_sec": 3,
                         "initial_delay_sec": 10
@@ -344,15 +350,20 @@ def validate_config(config: dict) -> list[str]:
         if ks.get("mode") == "firewall":
             fw = ks.get("firewall", {})
             ips = fw.get("vpn_server_ips", [])
-            if not ips:
-                errors.append(
-                    "kill_switch.firewall.vpn_server_ips пустой — заполни IP VPN-сервера"
-                )
-            elif PLACEHOLDER_VPN_IP in ips:
+            has_program = bool(fw.get("openvpn_exe"))
+            has_iface = bool(fw.get("vpn_interface"))
+            has_subnet = bool(fw.get("vpn_tunnel_subnet"))
+            if PLACEHOLDER_VPN_IP in ips:
                 errors.append(
                     f"kill_switch.firewall.vpn_server_ips содержит плейсхолдер "
-                    f"'{PLACEHOLDER_VPN_IP}' — замени на реальный IP, иначе "
-                    f"kill switch не включится"
+                    f"'{PLACEHOLDER_VPN_IP}' — замени на реальный IP или удали из списка"
+                )
+            # Нужен хотя бы один способ выпустить трафик: процесс OpenVPN,
+            # имя интерфейса, или (запасной) whitelist IP / подсеть.
+            if not (has_program or has_iface or ips or has_subnet):
+                errors.append(
+                    "kill_switch.firewall: укажи openvpn_exe (рекомендуется) "
+                    "или vpn_interface, или vpn_server_ips — иначе нечего разрешить"
                 )
 
         vpn_tunnel = ks.get("vpn_tunnel")
@@ -390,6 +401,36 @@ def check_ping(host: str, timeout_sec: float) -> bool:
         return False
 
 
+def check_process_running(image_name: str) -> bool:
+    """True если процесс с таким именем (напр. 'openvpn.exe') запущен."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH"],
+            capture_output=True, creationflags=CREATE_NO_WINDOW,
+            timeout=5, text=True, encoding="cp866", errors="replace",
+        )
+        return image_name.lower() in (result.stdout or "").lower()
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def check_openvpn(config: dict) -> bool:
+    """
+    Health-check для OpenVPN GUI: VPN считается живым, только если
+      (1) процесс openvpn.exe запущен, И
+      (2) если задан host — пинг до него внутри туннеля проходит.
+    Это надёжнее голого ping: ping мог бы ответить и без VPN (тот же IP в локалке),
+    а проверка процесса ловит «GUI закрыли / VPN отвалился».
+    """
+    image = config.get("process", "openvpn.exe")
+    if not check_process_running(image):
+        return False
+    host = config.get("host")
+    if host:
+        return check_ping(host, config.get("timeout_sec", 3))
+    return True
+
+
 def run_health_check(config: dict) -> bool:
     """
     Выполняет health-check согласно конфигу. Возвращает True если всё ОК.
@@ -411,6 +452,9 @@ def run_health_check(config: dict) -> bool:
 
     if check_type == "ping":
         return check_ping(config["host"], timeout)
+
+    if check_type == "openvpn":
+        return check_openvpn(config)
 
     # process — проверяется снаружи (по факту жив ли Popen)
     return True
@@ -844,16 +888,29 @@ class TunnelManager:
         ports = fw.get("vpn_server_ports", [])
         protocols = fw.get("vpn_protocols", ["udp"])
 
+        # vpn_interface может быть строкой или списком — нормализуем в список
+        iface = fw.get("vpn_interface")
+        if isinstance(iface, str):
+            iface = [iface] if iface.strip() else None
+        elif not iface:
+            iface = None
+
         # Защита от случайной блокировки на дефолтном IP из шаблона
         if PLACEHOLDER_VPN_IP in ips:
             self._ks_log(
                 f"[FW ERROR] vpn_server_ips содержит плейсхолдер '{PLACEHOLDER_VPN_IP}' — "
-                f"kill switch НЕ включен. Замени на реальный IP VPN-сервера в tunnels.json"
+                f"kill switch НЕ включен. Замени на реальный IP или удали из списка."
             )
             return False
 
-        if not ips or not ports:
-            self._ks_log("[FW ERROR] vpn_server_ips или vpn_server_ports пусты — kill switch не включен")
+        # Нужен хотя бы один способ выпустить трафик наружу/в туннель.
+        has_program = bool(fw.get("openvpn_exe")) or kill_switch.detect_openvpn_exe() is not None
+        has_subnet = bool(fw.get("vpn_tunnel_subnet"))
+        if not (has_program or iface or ips or has_subnet):
+            self._ks_log(
+                "[FW ERROR] Нечего разрешить: не задан openvpn_exe / vpn_interface / "
+                "vpn_server_ips / vpn_tunnel_subnet — kill switch не включен"
+            )
             return False
 
         ok = kill_switch.enable_firewall_killswitch(
@@ -863,10 +920,13 @@ class TunnelManager:
             allow_local_network=fw.get("allow_local_network", True),
             inbound_allow=fw.get("inbound_allow", []),
             vpn_tunnel_subnet=fw.get("vpn_tunnel_subnet"),
+            openvpn_exe=fw.get("openvpn_exe") or None,
+            vpn_interface_aliases=iface,
             logger=self._ks_log,
         )
         if ok:
             self.ks_firewall_active = True
+            write_emergency_bat()
         return ok
 
     def _cleanup_on_exit(self):
@@ -1012,6 +1072,16 @@ class TunnelManager:
     def _open_logs_dir(self, icon, item):
         os.startfile(str(LOGS_DIR))
 
+    def _panic_disable_ks(self, icon, item):
+        """Аварийно снять firewall kill switch прямо из меню (нужен админ)."""
+        if not kill_switch.is_admin():
+            self._notify("⚠ Нужны права админа. Запусти '" + EMERGENCY_BAT.name + "' от администратора")
+            return
+        kill_switch.disable_firewall_killswitch(logger=self._ks_log)
+        self.ks_firewall_active = False
+        self._notify("✓ Kill switch снят — интернет разблокирован")
+        self._refresh_icon()
+
     def _open_config_errors(self, icon, item):
         err_log = LOGS_DIR / "config_errors.log"
         if err_log.exists():
@@ -1133,9 +1203,14 @@ class TunnelManager:
                     label = "🛡 Kill Switch (firewall): АКТИВЕН"
                 else:
                     label = "🛡 Kill Switch (firewall): НЕ АКТИВЕН (нет админ-прав?)"
+                items.append(pystray.MenuItem(label, None, enabled=False))
+                items.append(pystray.MenuItem(
+                    "🚨 Снять Kill Switch сейчас", self._panic_disable_ks,
+                    enabled=self.ks_firewall_active,
+                ))
             else:
                 label = "🛡 Kill Switch (tunnels): на страже"
-            items.append(pystray.MenuItem(label, None, enabled=False))
+                items.append(pystray.MenuItem(label, None, enabled=False))
 
         items.append(pystray.Menu.SEPARATOR)
         items.append(
@@ -1295,8 +1370,39 @@ def set_admin_autostart(enabled: bool) -> tuple[bool, str]:
 
 
 # ============================================================
-# Иконка трея
+# Аварийное снятие kill switch (генерируем .bat рядом с программой)
 # ============================================================
+# Если интернет ляжет и сама программа не стартует — пользователю нужен
+# гарантированный способ снять правила. Кладём готовый bat рядом с .exe.
+# Запускать от админа (ПКМ → Запуск от администратора).
+
+EMERGENCY_BAT = APP_DIR / "ОТКЛЮЧИТЬ-killswitch.bat"
+
+
+def write_emergency_bat():
+    content = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "net session >nul 2>&1\r\n"
+        "if %errorlevel% neq 0 (\r\n"
+        "  echo Запусти этот файл ОТ АДМИНИСТРАТОРА (ПКМ - Запуск от имени администратора).\r\n"
+        "  pause & exit /b 1\r\n"
+        ")\r\n"
+        "echo Снимаю kill switch (firewall-правила TunnelTray)...\r\n"
+        "powershell -NoProfile -Command \"Remove-NetFirewallRule -Group 'TunnelTrayKillSwitch' "
+        "-ErrorAction SilentlyContinue\"\r\n"
+        "echo Восстанавливаю исходящую политику firewall...\r\n"
+        "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound\r\n"
+        "echo Готово. Интернет восстановлен.\r\n"
+        "pause\r\n"
+    )
+    try:
+        EMERGENCY_BAT.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+
 
 def make_icon(healthy: int, problems: int) -> Image.Image:
     """
