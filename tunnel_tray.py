@@ -176,6 +176,8 @@ def load_config() -> dict:
                     "_vpn_server_ports_help": "Порты VPN-сервера. Обычно 1194 (OpenVPN), 51820 (WireGuard), 443.",
                     "vpn_protocols": ["udp"],
                     "_vpn_protocols_help": "Протоколы: [\"udp\"], [\"tcp\"], или оба [\"udp\", \"tcp\"]",
+                    "vpn_tunnel_subnet": "10.8.0.0/24",
+                    "_vpn_tunnel_subnet_help": "ВАЖНО для OpenVPN/WireGuard! Подсеть туннеля. Без неё kill switch заблокирует трафик ВНУТРИ туннеля (TAP-адаптер OpenVPN не относится к типу 'ras'). Узнать: после коннекта VPN выполни ipconfig, найди TAP/TUN-адаптер, возьми его подсеть. Обычно у OpenVPN 10.8.0.0/24. Для встроенного Windows-VPN можно оставить null.",
                     "allow_local_network": True,
                     "_allow_local_network_help": "Разрешать локальную подсеть (для NAS, принтеров, RDP в локалке).",
                     "cleanup_on_exit": False,
@@ -196,12 +198,15 @@ def load_config() -> dict:
                 {
                     "name": "openvpn",
                     "_name_help": "Любое короткое имя. На него ссылается depends_on у других туннелей.",
-                    "bat_path": "C:\\tunnels\\openvpn.bat",
+                    "monitor_only": True,
+                    "_monitor_only_help": "true — программа НЕ запускает .bat, а только следит жив ли VPN (для случая когда VPN поднимается внешним клиентом, напр. OpenVPN GUI). Зависимые туннели стартуют когда этот станет HEALTHY. false (или убрать) — программа сама запускает bat_path.",
+                    "bat_path": None,
                     "autostart": True,
                     "depends_on": None,
                     "health_check": {
                         "type": "ping",
-                        "host": "10.8.0.2",
+                        "host": "10.8.0.1",
+                        "_host_help": "IP внутри VPN-сети для проверки что туннель жив. Шлюз VPN. Узнать после коннекта: ipconfig → адаптер TAP/TUN.",
                         "interval_sec": 15,
                         "timeout_sec": 3,
                         "initial_delay_sec": 10
@@ -295,8 +300,9 @@ def validate_config(config: dict) -> list[str]:
         names.append(name)
 
         bat = t.get("bat_path")
-        if not bat or not isinstance(bat, str):
-            errors.append(f"туннель '{name}': bat_path пустой")
+        if not t.get("monitor_only", False):
+            if not bat or not isinstance(bat, str):
+                errors.append(f"туннель '{name}': bat_path пустой (или поставь monitor_only: true)")
 
     # ---------- зависимости ----------
     name_set = set(names)
@@ -449,11 +455,12 @@ class Backoff:
 @dataclass
 class TunnelConfig:
     name: str
-    bat_path: str
+    bat_path: str | None = None
     autostart: bool = False
     depends_on: str | None = None
     health_check: dict = field(default_factory=lambda: {"type": "process"})
     auto_reconnect: bool = False
+    monitor_only: bool = False  # не запускать .bat, только мониторить статус (для VPN из внешнего GUI)
 
 
 class Tunnel:
@@ -637,6 +644,13 @@ class Tunnel:
         return not dep.is_healthy
 
     def _monitor_loop(self):
+        # Monitor-only туннель: ничего не запускаем, только следим за статусом.
+        # Используется для VPN, который поднимается внешним клиентом (OpenVPN GUI):
+        # программа лишь определяет жив ли VPN, а зависимые туннели стартуют по этому статусу.
+        if self.cfg.monitor_only:
+            self._monitor_only_loop()
+            return
+
         hc = self.cfg.health_check
         interval = hc.get("interval_sec", 10)
         initial_delay = hc.get("initial_delay_sec", 5)
@@ -710,6 +724,37 @@ class Tunnel:
         self._log(f"Реконнект через {delay} сек (попытка #{self.backoff.attempt})")
         self._stop_event.wait(delay)
 
+    def _monitor_only_loop(self):
+        """
+        Цикл для monitor_only туннеля. Ничего не запускает и не убивает —
+        только периодически проверяет health-check и выставляет статус
+        HEALTHY/UNHEALTHY. Зависимые туннели реагируют на этот статус.
+        """
+        hc = self.cfg.health_check
+        interval = hc.get("interval_sec", 10)
+        initial_delay = hc.get("initial_delay_sec", 5)
+
+        self._set_status(Status.STARTING)
+        self._log("Monitor-only режим: слежу за внешним подключением (запуск .bat не выполняется)")
+
+        if self._stop_event.wait(initial_delay):
+            self._set_status(Status.STOPPED)
+            return
+
+        while not self._stop_event.is_set() and self._enabled:
+            ok = run_health_check(hc) if hc.get("type") != "process" else True
+            if ok:
+                if self.status != Status.HEALTHY:
+                    self._set_status(Status.HEALTHY)
+                    self.backoff.reset()
+            else:
+                if self.status != Status.UNHEALTHY:
+                    self._set_status(Status.UNHEALTHY)
+            if self._stop_event.wait(interval):
+                break
+
+        self._set_status(Status.STOPPED)
+
 
 # ============================================================
 # Менеджер
@@ -733,8 +778,11 @@ class TunnelManager:
                 continue
             name = t.get("name")
             bat = t.get("bat_path")
-            if not name or not bat or name in seen_names:
-                continue  # битые/дублирующиеся пропускаем (уже залогированы в validate_config)
+            monitor_only = t.get("monitor_only", False)
+            if not name or name in seen_names:
+                continue
+            if not monitor_only and not bat:
+                continue  # обычному туннелю нужен bat (уже залогировано в validate_config)
             seen_names.add(name)
             cfg = TunnelConfig(
                 name=name,
@@ -743,6 +791,7 @@ class TunnelManager:
                 depends_on=t.get("depends_on"),
                 health_check=t.get("health_check", {"type": "process"}),
                 auto_reconnect=t.get("auto_reconnect", False),
+                monitor_only=monitor_only,
             )
             self.tunnels.append(Tunnel(cfg, self))
 
@@ -762,6 +811,9 @@ class TunnelManager:
 
         # Debounce уведомлений: {текст_уведомления: последний_timestamp}
         self._notification_history: dict[str, float] = {}
+
+        # Кэш состояния admin-автозапуска (чтобы не дёргать schtasks каждые 2 сек при перерисовке меню)
+        self._admin_autostart_cached = is_admin_autostart_enabled()
 
     def _write_config_errors(self):
         err_log = LOGS_DIR / "config_errors.log"
@@ -810,6 +862,7 @@ class TunnelManager:
             vpn_protocols=protocols,
             allow_local_network=fw.get("allow_local_network", True),
             inbound_allow=fw.get("inbound_allow", []),
+            vpn_tunnel_subnet=fw.get("vpn_tunnel_subnet"),
             logger=self._ks_log,
         )
         if ok:
@@ -926,7 +979,32 @@ class TunnelManager:
         self._refresh_icon()
 
     def _toggle_autostart(self, icon, item):
-        set_autostart(not is_autostart_enabled())
+        new = not is_autostart_enabled()
+        set_autostart(new)
+        if new and self._admin_autostart_cached:
+            # Обычный автостарт запускает БЕЗ админа — убираем admin-задачу,
+            # иначе при логине будет гонка двух запусков (mutex пропустит только один)
+            set_admin_autostart(False)
+            self._admin_autostart_cached = False
+
+    def _toggle_admin_autostart(self, icon, item):
+        enabled = self._admin_autostart_cached
+        if not enabled and not kill_switch.is_admin():
+            self._notify("⚠ Чтобы настроить автозапуск от админа, запусти программу от администратора")
+            return
+        ok, out = set_admin_autostart(not enabled)
+        if ok:
+            self._admin_autostart_cached = not enabled
+            if not enabled:
+                # Включили admin-задачу — убираем обычный реестровый автостарт
+                set_autostart(False)
+                self._notify("✓ Автозапуск от админа включён (без UAC при входе)")
+            else:
+                self._notify("✓ Автозапуск от админа выключен")
+        else:
+            self._notify("⚠ Не удалось изменить задачу автозапуска")
+            self._ks_log(f"[TASK] schtasks: {out.strip()}")
+        self._refresh_icon()
 
     def _open_config(self, icon, item):
         os.startfile(str(CONFIG_PATH))
@@ -966,7 +1044,10 @@ class TunnelManager:
                 continue
             name = t.get("name")
             bat = t.get("bat_path")
-            if not name or not bat or name in seen_names:
+            monitor_only = t.get("monitor_only", False)
+            if not name or name in seen_names:
+                continue
+            if not monitor_only and not bat:
                 continue
             seen_names.add(name)
             cfg = TunnelConfig(
@@ -976,6 +1057,7 @@ class TunnelManager:
                 depends_on=t.get("depends_on"),
                 health_check=t.get("health_check", {"type": "process"}),
                 auto_reconnect=t.get("auto_reconnect", False),
+                monitor_only=monitor_only,
             )
             self.tunnels.append(Tunnel(cfg, self))
 
@@ -1058,9 +1140,16 @@ class TunnelManager:
         items.append(pystray.Menu.SEPARATOR)
         items.append(
             pystray.MenuItem(
-                "Автостарт Windows",
+                "Автостарт Windows (обычный)",
                 self._toggle_autostart,
                 checked=lambda item: is_autostart_enabled(),
+            )
+        )
+        items.append(
+            pystray.MenuItem(
+                "Автозапуск от админа (без UAC)",
+                self._toggle_admin_autostart,
+                checked=lambda item: self._admin_autostart_cached,
             )
         )
         items.append(pystray.MenuItem("Открыть конфиг (tunnels.json)", self._open_config))
@@ -1152,6 +1241,57 @@ def set_autostart(enabled: bool):
                 winreg.DeleteValue(key, APP_NAME)
             except FileNotFoundError:
                 pass
+
+
+# ============================================================
+# Автозапуск ОТ АДМИНА без UAC — через Task Scheduler
+# ============================================================
+# Реестровый автостарт (HKCU\...\Run) запускает БЕЗ прав админа, и если на .exe
+# стоит "запускать от администратора" — выскочит UAC-промпт.
+# Так делает OpenVPN GUI: задача в Планировщике с "наивысшими правами" запускает
+# процесс elevated при входе в систему, БЕЗ запроса пароля/подтверждения.
+
+TASK_NAME = APP_NAME  # имя задачи в Планировщике
+
+
+def _schtasks(args: list[str]) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["schtasks"] + args,
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True,
+            timeout=10,
+            text=True,
+            encoding="cp866",
+            errors="replace",
+        )
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    except Exception as e:
+        return False, str(e)
+
+
+def is_admin_autostart_enabled() -> bool:
+    """Проверяет, существует ли задача автозапуска в Планировщике."""
+    ok, _ = _schtasks(["/Query", "/TN", TASK_NAME])
+    return ok
+
+
+def set_admin_autostart(enabled: bool) -> tuple[bool, str]:
+    """
+    Создаёт/удаляет задачу автозапуска от админа.
+    Создание требует прав администратора (из-за /RL HIGHEST).
+    """
+    if enabled:
+        # /SC ONLOGON — при входе в систему
+        # /RL HIGHEST — с наивысшими правами (elevated, без UAC-промпта)
+        # /F — перезаписать если уже есть
+        run_cmd = get_exe_path()  # уже с кавычками
+        return _schtasks([
+            "/Create", "/TN", TASK_NAME, "/TR", run_cmd,
+            "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
+        ])
+    else:
+        return _schtasks(["/Delete", "/TN", TASK_NAME, "/F"])
 
 
 # ============================================================

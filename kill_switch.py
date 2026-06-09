@@ -120,6 +120,7 @@ def _rule_name(suffix: str) -> str:
 _KNOWN_RULE_SUFFIXES = [
     "BlockAllOut",
     "AllowVPNInterface",
+    "AllowVPNSubnetOut",
     "AllowLocalNetOut",
     "AllowDHCP",
     "AllowLoopback",
@@ -158,6 +159,7 @@ def enable_firewall_killswitch(
     vpn_protocols: list[str],
     allow_local_network: bool,
     inbound_allow: list[dict] | None,
+    vpn_tunnel_subnet: str | None = None,
     logger=None,
 ) -> bool:
     """
@@ -170,6 +172,11 @@ def enable_firewall_killswitch(
       allow_local_network: разрешить локальную подсеть.
       inbound_allow: список словарей вида {"port": 3389, "protocol": "tcp", "name": "RDP"}
                      для разрешения входящих коннектов в обход VPN.
+      vpn_tunnel_subnet: подсеть туннеля, например "10.8.0.0/24" (для OpenVPN/WireGuard).
+                     Разрешает исходящий трафик с локальным IP из этой подсети —
+                     то есть трафик приложений, который OpenVPN заворачивает в TAP-адаптер.
+                     Без этого kill switch заблокирует трафик ВНУТРИ туннеля, т.к.
+                     TAP-адаптер OpenVPN не относится к типу 'ras'.
     """
     if not is_admin():
         if logger:
@@ -199,7 +206,6 @@ def enable_firewall_killswitch(
     ok, _ = _run_netsh([
         "firewall", "add", "rule",
         f"name={_rule_name('BlockAllOut')}",
-        f"group={FIREWALL_GROUP}",
         "dir=out",
         "action=block",
         "enable=yes",
@@ -213,7 +219,6 @@ def enable_firewall_killswitch(
     _run_netsh([
         "firewall", "add", "rule",
         f"name={_rule_name('AllowLoopback')}",
-        f"group={FIREWALL_GROUP}",
         "dir=out",
         "action=allow",
         "enable=yes",
@@ -225,7 +230,6 @@ def enable_firewall_killswitch(
     _run_netsh([
         "firewall", "add", "rule",
         f"name={_rule_name('AllowDHCP')}",
-        f"group={FIREWALL_GROUP}",
         "dir=out",
         "action=allow",
         "enable=yes",
@@ -235,11 +239,11 @@ def enable_firewall_killswitch(
         "remoteport=67",
     ], logger=logger)
 
-    # 4. РАЗРЕШИТЬ VPN-интерфейс (весь трафик через ras-интерфейсы)
+    # 4. РАЗРЕШИТЬ VPN-интерфейс (весь трафик через ras-интерфейсы).
+    #    Работает для встроенного Windows-VPN (L2TP/IKEv2/SSTP/PPTP).
     _run_netsh([
         "firewall", "add", "rule",
         f"name={_rule_name('AllowVPNInterface')}",
-        f"group={FIREWALL_GROUP}",
         "dir=out",
         "action=allow",
         "enable=yes",
@@ -249,6 +253,23 @@ def enable_firewall_killswitch(
     if logger:
         logger("[FW] Разрешён трафик через VPN-интерфейсы (type=ras)")
 
+    # 4b. РАЗРЕШИТЬ трафик из подсети туннеля (для OpenVPN/WireGuard).
+    #    TAP/Wintun-адаптер OpenVPN НЕ относится к типу 'ras', поэтому правило
+    #    выше его не покрывает. Здесь разрешаем исходящий трафик с локальным IP
+    #    из подсети туннеля — это и есть трафик приложений, заворачиваемый в TAP.
+    if vpn_tunnel_subnet:
+        _run_netsh([
+            "firewall", "add", "rule",
+            f"name={_rule_name('AllowVPNSubnetOut')}",
+            "dir=out",
+            "action=allow",
+            "enable=yes",
+            "profile=any",
+            f"localip={vpn_tunnel_subnet}",
+        ], logger=logger)
+        if logger:
+            logger(f"[FW] Разрешён трафик из подсети туннеля {vpn_tunnel_subnet} (OpenVPN/WireGuard TAP)")
+
     # 5. РАЗРЕШИТЬ коннект к IP:PORT VPN-сервера
     rule_idx = 0
     for ip in valid_ips:
@@ -257,7 +278,6 @@ def enable_firewall_killswitch(
                 _run_netsh([
                     "firewall", "add", "rule",
                     f"name={_rule_name(f'AllowVPNServer_{rule_idx}')}",
-                    f"group={FIREWALL_GROUP}",
                     "dir=out",
                     "action=allow",
                     "enable=yes",
@@ -276,7 +296,6 @@ def enable_firewall_killswitch(
         _run_netsh([
             "firewall", "add", "rule",
             f"name={_rule_name('AllowLocalNetOut')}",
-            f"group={FIREWALL_GROUP}",
             "dir=out",
             "action=allow",
             "enable=yes",
@@ -304,7 +323,6 @@ def enable_firewall_killswitch(
             cmd = [
                 "firewall", "add", "rule",
                 f"name={_rule_name(f'AllowInbound_{idx}')}",
-                f"group={FIREWALL_GROUP}",
                 "dir=in",
                 "action=allow",
                 "enable=yes",
