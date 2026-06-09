@@ -101,6 +101,46 @@ def acquire_single_instance():
 
 
 # ============================================================
+# JSONC — JSON с комментариями
+# ============================================================
+# tunnels.json поддерживает однострочные // комментарии.
+# Перед парсингом они вырезаются с учётом строковых литералов
+# (чтобы "https://..." внутри значений не пострадало).
+
+def strip_json_comments(text: str) -> str:
+    """Удаляет // комментарии из JSONC, не трогая содержимое строк."""
+    result = []
+    i = 0
+    in_string = False
+    escape_next = False
+    while i < len(text):
+        c = text[i]
+        if escape_next:
+            result.append(c)
+            escape_next = False
+            i += 1
+            continue
+        if c == '\\' and in_string:
+            result.append(c)
+            escape_next = True
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+            i += 1
+            continue
+        if not in_string and c == '/' and i + 1 < len(text) and text[i + 1] == '/':
+            # Пропускаем всё до конца строки
+            while i < len(text) and text[i] != '\n':
+                i += 1
+            continue
+        result.append(c)
+        i += 1
+    return ''.join(result)
+
+
+# ============================================================
 # Статусы туннеля
 # ============================================================
 
@@ -203,7 +243,21 @@ def load_config() -> dict:
         CONFIG_PATH.write_text(
             json.dumps(example, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw = CONFIG_PATH.read_text(encoding="utf-8")
+    clean = strip_json_comments(raw)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        # Записываем ошибку в лог чтобы пользователь увидел
+        err_log = LOGS_DIR / "config_errors.log"
+        try:
+            with open(err_log, "w", encoding="utf-8") as f:
+                f.write(f"Ошибка парсинга {CONFIG_PATH}:\n\n  {e}\n\n")
+                f.write("Проверь JSON-синтаксис: лишние запятые, незакрытые кавычки, и т.д.\n")
+                f.write("Онлайн-валидатор: https://jsonlint.com\n")
+        except Exception:
+            pass
+        raise
 
 
 def validate_config(config: dict) -> list[str]:
@@ -885,6 +939,68 @@ class TunnelManager:
         if err_log.exists():
             os.startfile(str(err_log))
 
+    def _reload_config(self, icon, item):
+        """Перезагружает конфиг без перезапуска программы."""
+        # 1. Останавливаем все туннели
+        self.stop_all()
+        time.sleep(1)
+
+        # 2. Перечитываем конфиг
+        try:
+            config = load_config()
+        except json.JSONDecodeError as e:
+            self._notify(f"⚠ Ошибка в конфиге: {e}")
+            self._refresh_icon()
+            return
+
+        # 3. Валидация
+        self._config_errors = validate_config(config)
+        if self._config_errors:
+            self._write_config_errors()
+
+        # 4. Пересоздаём список туннелей
+        self.tunnels = []
+        seen_names: set[str] = set()
+        for t in config.get("tunnels", []):
+            if not isinstance(t, dict):
+                continue
+            name = t.get("name")
+            bat = t.get("bat_path")
+            if not name or not bat or name in seen_names:
+                continue
+            seen_names.add(name)
+            cfg = TunnelConfig(
+                name=name,
+                bat_path=bat,
+                autostart=t.get("autostart", False),
+                depends_on=t.get("depends_on"),
+                health_check=t.get("health_check", {"type": "process"}),
+                auto_reconnect=t.get("auto_reconnect", False),
+            )
+            self.tunnels.append(Tunnel(cfg, self))
+
+        # 5. Перечитываем kill switch конфиг
+        old_ks_active = self.ks_firewall_active
+        self.ks_config = config.get("kill_switch", {"enabled": False})
+
+        # Если KS включён и мы админы — переприменяем правила (cleanup + add)
+        if self.ks_config.get("enabled") and self.ks_config.get("mode") == "firewall":
+            if kill_switch.is_admin():
+                self._activate_firewall_killswitch()
+        elif old_ks_active:
+            # KS был активен, но в новом конфиге выключен — снимаем правила
+            kill_switch.disable_firewall_killswitch(logger=self._ks_log)
+            self.ks_firewall_active = False
+
+        # 6. Запускаем autostart-туннели
+        self.start_all_autostart()
+        self._refresh_icon()
+
+        if self._config_errors:
+            self._notify(f"⚠ Конфиг: {len(self._config_errors)} ошибок — см. logs/config_errors.log")
+        else:
+            self._notify("✓ Конфиг перезагружен")
+
     def _quit(self, icon, item):
         self.stop_all()
         time.sleep(1)
@@ -948,6 +1064,7 @@ class TunnelManager:
             )
         )
         items.append(pystray.MenuItem("Открыть конфиг (tunnels.json)", self._open_config))
+        items.append(pystray.MenuItem("🔄 Перезагрузить конфиг", self._reload_config))
         items.append(pystray.MenuItem("Открыть папку логов", self._open_logs_dir))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Выход", self._quit))
